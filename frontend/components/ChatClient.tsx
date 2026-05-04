@@ -5,6 +5,20 @@ import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CHAT_URL } from "@/lib/urls";
 
+/** FastAPI uses `{ detail: "..." }`; some proxies use `{ error: "..." }`. */
+function fastApiErrorMessage(data: unknown, fallback: string): string {
+  if (!data || typeof data !== "object") return fallback;
+  const d = data as { detail?: unknown; error?: string };
+  if (typeof d.error === "string" && d.error) return d.error;
+  const det = d.detail;
+  if (typeof det === "string" && det) return det;
+  if (Array.isArray(det) && det.length > 0) {
+    const first = det[0] as { msg?: string } | undefined;
+    if (first?.msg) return first.msg;
+  }
+  return fallback;
+}
+
 type Role = "user" | "assistant";
 
 type ChatMessage = {
@@ -95,14 +109,17 @@ export function ChatClient() {
       const res = await fetch(CHAT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, docId, docName }),
+        body: JSON.stringify({ message: text, docId }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         reply?: string;
         error?: string;
+        detail?: unknown;
       };
       if (!res.ok) {
-        throw new Error(data.error || "Request failed");
+        throw new Error(
+          fastApiErrorMessage(data, `Request failed (${res.status})`),
+        );
       }
       const reply =
         typeof data.reply === "string"
@@ -127,7 +144,7 @@ export function ChatClient() {
     } finally {
       setSending(false);
     }
-  }, [input, sending, docId, docName]);
+  }, [input, sending, docId]);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {

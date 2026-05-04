@@ -1,3 +1,5 @@
+# Install with: pip install -r requirements.txt
+# Run API with the same Python: source venv/bin/activate OR ./run_dev.sh
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12

@@ -3,13 +3,18 @@ from __future__ import annotations
 import io
 import logging
 import os
+import sys
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
+
+from chunking import split_text_into_chunks
+from embeddings import embed_texts
+from retrieval import retrieve_context
 
 load_dotenv()
 
@@ -24,8 +29,8 @@ os.environ.setdefault(
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 MAX_CONTEXT_CHARS = 120_000
 
-# doc_id -> {"text": str, "file_name": str}
-DOCUMENT_STORE: dict[str, dict[str, str]] = {}
+# doc_id -> { text, file_name, chunks, embeddings: list[list[float]] }
+DOCUMENT_STORE: dict[str, dict[str, Any]] = {}
 
 _azure_chain: Any = None
 
@@ -47,9 +52,16 @@ def get_answer_chain():
     if _azure_chain is not None:
         return _azure_chain
 
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_openai import AzureChatOpenAI
+    try:
+        from langchain_core.output_parsers import StrOutputParser
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_openai import AzureChatOpenAI
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "LangChain packages are missing. Install: pip install -r requirements.txt "
+            f"using the same Python as uvicorn (this one: {sys.executable}). "
+            "Or run: ./run_dev.sh from the backend folder."
+        ) from e
 
     azure_endpoint, api_key, api_version, chat_deployment = _azure_env()
     if not azure_endpoint or not api_key:
@@ -70,10 +82,10 @@ def get_answer_chain():
         [
             (
                 "system",
-                "You are a helpful assistant. Answer the user's question using "
-                "only the document content below when it is relevant. If the "
-                "answer is not in the document, say so clearly and offer what "
-                "you can infer safely. Be concise.\n\n--- Document ---\n{context}\n--- End ---",
+                "You are a helpful assistant. Answer using only the retrieved "
+                "passages below when they are relevant. If the answer is not in "
+                "the passages, say so clearly. Be concise.\n\n"
+                "--- Retrieved passages ---\n{context}\n--- End ---",
             ),
             ("human", "{question}"),
         ]
@@ -140,8 +152,28 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
+class UploadResponse(BaseModel):
+    """JSON body returned on successful POST /upload."""
+
+    ok: bool = True
+    docId: str = Field(description="Session id for POST /chat")
+    fileName: str
+    size: int = Field(description="Original file size in bytes")
+    type: str = Field(description="Client-provided MIME type")
+    textLength: int = Field(
+        description="Length of extracted text stored server-side (capped by MAX_CONTEXT_CHARS)"
+    )
+    chunkCount: int = Field(
+        description="Number of text chunks derived for later retrieval / RAG"
+    )
+    embeddingDim: int = Field(
+        default=0,
+        description="Vector size for each chunk embedding (0 if no chunks)",
+    )
+
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload(file: UploadFile = File(...)) -> UploadResponse:
     raw = await file.read()
     if len(raw) == 0:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -164,25 +196,59 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
             detail="No text could be extracted from this file.",
         )
 
+    stored_text = text[:MAX_CONTEXT_CHARS]
+    chunks = split_text_into_chunks(stored_text)
+    chunk_payload = [c.to_store_dict() for c in chunks]
+
+    chunk_texts = [c["text"] for c in chunk_payload]
+    embedding_vectors: list[list[float]] = []
+    try:
+        embedding_vectors = embed_texts(chunk_texts)
+    except RuntimeError as e:
+        # Missing keys, wrong venv, or no embedding deployment — still store doc; chat uses full text.
+        logger.warning("Embeddings skipped (upload still succeeds): %s", e)
+    except Exception as e:
+        logger.exception("Embeddings failed; continuing without vectors: %s", e)
+
+    embedding_dim = len(embedding_vectors[0]) if embedding_vectors else 0
+
     doc_id = str(uuid.uuid4())
     DOCUMENT_STORE[doc_id] = {
-        "text": text[:MAX_CONTEXT_CHARS],
+        "text": stored_text,
         "file_name": fname,
+        "chunks": chunk_payload,
+        "embeddings": embedding_vectors,
     }
-    logger.info("Stored document %s (%s chars)", doc_id, len(DOCUMENT_STORE[doc_id]["text"]))
+    logger.info(
+        "Stored document %s (%s chars, %s chunks, emb_dim=%s)",
+        doc_id,
+        len(stored_text),
+        len(chunk_payload),
+        embedding_dim,
+    )
 
-    return {
-        "ok": True,
-        "docId": doc_id,
-        "fileName": fname,
-        "size": len(raw),
-        "type": file.content_type or "application/octet-stream",
-    }
+    return UploadResponse(
+        ok=True,
+        docId=doc_id,
+        fileName=fname,
+        size=len(raw),
+        type=file.content_type or "application/octet-stream",
+        textLength=len(stored_text),
+        chunkCount=len(chunk_payload),
+        embeddingDim=embedding_dim,
+    )
 
 
 class ChatBody(BaseModel):
     message: str = Field(..., min_length=1)
-    docId: str | None = None
+    docId: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("docId", "doc_id"),
+    )
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @app.post("/chat")
@@ -192,24 +258,55 @@ def chat(body: ChatBody) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="Message is required")
 
     doc_id = (body.docId or "").strip()
-    if not doc_id or doc_id not in DOCUMENT_STORE:
+    if not doc_id:
         raise HTTPException(
             status_code=400,
-            detail="Unknown or missing document. Upload a file first.",
+            detail="Missing docId in request body. Expected JSON: { \"message\": \"...\", \"docId\": \"<uuid>\" }.",
+        )
+    if doc_id not in DOCUMENT_STORE:
+        raise HTTPException(
+            status_code=400,
+            detail="Document session expired or server was restarted — upload the file again. (docId not found)",
         )
 
     entry = DOCUMENT_STORE[doc_id]
-    context = entry["text"]
+    chunks = entry.get("chunks") or []
+    embs = entry.get("embeddings") or []
+
+    context: str
+    if chunks and embs and len(chunks) == len(embs):
+        try:
+            context = retrieve_context(text, chunks, embs)
+        except Exception as e:
+            logger.warning("RAG retrieval failed, using full document: %s", e)
+            context = ""
+        if not (context and context.strip()):
+            context = str(entry.get("text", ""))
+    else:
+        context = str(entry.get("text", ""))
+
+    # Local/dev without Azure chat: set CHAT_MOCK=1 in .env → 200 + stub reply (no 503).
+    if _env_truthy("CHAT_MOCK"):
+        preview = context[:800] + ("…" if len(context) > 800 else "")
+        return {
+            "reply": (
+                "[Mock LLM — set CHAT_MOCK=0 and AZURE_OPENAI_URL / AZURE_OPENAI_KEY for real answers]\n\n"
+                f"Your question: {text}\n\n"
+                f"Context passed to the model (truncated):\n{preview or '(empty)'}"
+            )
+        }
 
     try:
         chain = get_answer_chain()
         reply = chain.invoke({"context": context, "question": text})
     except RuntimeError as e:
         logger.warning("%s", e)
-        raise HTTPException(
-            status_code=503,
-            detail=str(e),
-        ) from e
+        detail = str(e)
+        if "AZURE_OPENAI" in detail or "LangChain" in detail:
+            detail += (
+                " — Or set CHAT_MOCK=1 in backend/.env for a stub response without Azure."
+            )
+        raise HTTPException(status_code=503, detail=detail) from e
     except Exception as e:
         logger.exception("chat invoke failed")
         raise HTTPException(
