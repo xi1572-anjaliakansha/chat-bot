@@ -5,10 +5,6 @@ export const metadata: Metadata = {
   description: "Ask questions about your uploaded document.",
 };
 
-export default function ChatLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function ChatLayout({ children }: { children: React.ReactNode }) {
   return children;
 }
