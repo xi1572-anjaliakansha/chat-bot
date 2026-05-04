@@ -1,0 +1,8 @@
+# Declares Git submodules for this repository.
+# Add a submodule (Git will append the [submodule] block below):
+#   git submodule add <repository-url> <path>
+#
+# Example after adding `vendor/shared-lib`:
+# [submodule "vendor/shared-lib"]
+#	path = vendor/shared-lib
+#	url = https://github.com/org/shared-lib.git
